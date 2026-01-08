@@ -49,6 +49,9 @@ enum SlideshowInterval: TimeInterval, CaseIterable, Identifiable {
 
 @MainActor
 final class SlideshowViewModel: ObservableObject {
+    private static let selectedAlbumKey = "selectedAlbumID"
+    private static let selectedIntervalKey = "selectedInterval"
+
     struct Album: Identifiable, Hashable {
         let id: String
         let title: String
@@ -69,15 +72,22 @@ final class SlideshowViewModel: ObservableObject {
     @Published var selectedAlbumID: String? {
         didSet {
             guard oldValue != selectedAlbumID else { return }
+            if let selectedAlbumID {
+                UserDefaults.standard.set(selectedAlbumID, forKey: Self.selectedAlbumKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.selectedAlbumKey)
+            }
             loadAssetsForSelectedAlbum()
         }
     }
-    @Published var selectedInterval: SlideshowInterval = .fiveMinutes {
+    @Published var selectedInterval: SlideshowInterval {
         didSet {
+            UserDefaults.standard.set(selectedInterval.rawValue, forKey: Self.selectedIntervalKey)
             scheduleTimer()
         }
     }
     @Published var currentImage: UIImage?
+    @Published private(set) var currentAssetIdentifier: String?
     @Published var isLoadingAlbums = false
     @Published var isLoadingAssets = false
 
@@ -89,6 +99,17 @@ final class SlideshowViewModel: ObservableObject {
     private var imageRequestID: PHImageRequestID?
     private var isActive = true
 
+    init() {
+        let storedInterval = UserDefaults.standard.double(forKey: Self.selectedIntervalKey)
+        if let interval = SlideshowInterval(rawValue: storedInterval), storedInterval > 0 {
+            selectedInterval = interval
+        } else {
+            selectedInterval = .fiveMinutes
+        }
+
+        selectedAlbumID = UserDefaults.standard.string(forKey: Self.selectedAlbumKey)
+    }
+
     var isAuthorized: Bool {
         authorizationStatus == .authorized || authorizationStatus == .limited
     }
@@ -99,10 +120,11 @@ final class SlideshowViewModel: ObservableObject {
 
     func requestAccess() {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
+            guard let self else { return }
             Task { @MainActor in
-                self?.authorizationStatus = status
-                if self?.isAuthorized == true {
-                    self?.loadAlbums()
+                self.authorizationStatus = status
+                if self.isAuthorized {
+                    self.loadAlbums()
                 }
             }
         }
@@ -125,12 +147,12 @@ final class SlideshowViewModel: ObservableObject {
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "localizedTitle", ascending: true)]
 
         var fetchedAlbums: [Album] = []
+        var seen = Set<String>()
         let albumResults = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: fetchOptions)
-        albumResults.enumerateObjects { collection, _, _ in
-            let title = collection.localizedTitle ?? "Untitled Album"
-            let isShared = collection.assetCollectionSubtype == .albumCloudShared
-            fetchedAlbums.append(Album(id: collection.localIdentifier, title: title, isShared: isShared, collection: collection))
-        }
+        appendAlbums(from: albumResults, to: &fetchedAlbums, seen: &seen)
+
+        let smartResults = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .any, options: fetchOptions)
+        appendAlbums(from: smartResults, to: &fetchedAlbums, seen: &seen)
 
         albums = fetchedAlbums
 
@@ -140,7 +162,7 @@ final class SlideshowViewModel: ObservableObject {
                 loadAssetsForSelectedAlbum()
             }
         } else {
-            selectedAlbumID = albums.first?.id
+            selectedAlbumID = firstAlbumWithPhotos(in: albums)?.id ?? albums.first?.id
             if selectedAlbumID == nil {
                 resetSlideshow()
             }
@@ -178,6 +200,27 @@ final class SlideshowViewModel: ObservableObject {
         } else {
             showCurrentAsset()
             scheduleTimer()
+        }
+    }
+
+    private func appendAlbums(from results: PHFetchResult<PHAssetCollection>, to albums: inout [Album], seen: inout Set<String>) {
+        guard results.count > 0 else { return }
+        for index in 0..<results.count {
+            let collection = results.object(at: index)
+            let identifier = collection.localIdentifier
+            guard seen.insert(identifier).inserted else { continue }
+            let title = collection.localizedTitle ?? "Untitled Album"
+            let isShared = collection.assetCollectionSubtype == .albumCloudShared
+            albums.append(Album(id: identifier, title: title, isShared: isShared, collection: collection))
+        }
+    }
+
+    private func firstAlbumWithPhotos(in albums: [Album]) -> Album? {
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+        options.fetchLimit = 1
+        return albums.first { album in
+            PHAsset.fetchAssets(in: album.collection, options: options).count > 0
         }
     }
 
@@ -220,10 +263,12 @@ final class SlideshowViewModel: ObservableObject {
     private func showCurrentAsset() {
         guard !shuffledAssets.isEmpty else {
             currentImage = nil
+            currentAssetIdentifier = nil
             return
         }
 
         let asset = shuffledAssets[currentIndex]
+        currentAssetIdentifier = asset.localIdentifier
         requestImage(for: asset)
     }
 
@@ -237,11 +282,7 @@ final class SlideshowViewModel: ObservableObject {
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
 
-        let scale = UIScreen.main.scale
-        let targetSize = CGSize(
-            width: UIScreen.main.bounds.width * scale,
-            height: UIScreen.main.bounds.height * scale
-        )
+        let targetSize = PHImageManagerMaximumSize
 
         imageRequestID = imageManager.requestImage(
             for: asset,
@@ -249,7 +290,10 @@ final class SlideshowViewModel: ObservableObject {
             contentMode: .aspectFit,
             options: options
         ) { [weak self] image, _ in
-            self?.currentImage = image
+            guard let self else { return }
+            Task { @MainActor in
+                self.currentImage = image
+            }
         }
     }
 
@@ -258,7 +302,10 @@ final class SlideshowViewModel: ObservableObject {
         guard isAuthorized, isActive, !allAssets.isEmpty else { return }
 
         slideshowTimer = Timer.scheduledTimer(withTimeInterval: selectedInterval.rawValue, repeats: true) { [weak self] _ in
-            self?.showNext()
+            guard let self else { return }
+            Task { @MainActor in
+                self.showNext()
+            }
         }
     }
 
@@ -272,6 +319,7 @@ final class SlideshowViewModel: ObservableObject {
         shuffledAssets = []
         currentIndex = 0
         currentImage = nil
+        currentAssetIdentifier = nil
         stopTimer()
     }
 }

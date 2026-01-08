@@ -15,17 +15,23 @@ struct ContentView: View {
     @State private var showControls = false
     @State private var showSettingsSheet = false
     @State private var isAspectFill = false
+    @GestureState private var dragTranslation: CGFloat = 0
+    @State private var dragOffset: CGFloat = 0
+    @State private var isTransitioning = false
+    @State private var hideControlsTask: Task<Void, Never>?
 
     private let swipeThreshold: CGFloat = 50
+    private let controlsHideDelay: UInt64 = 1_500_000_000
 
     var body: some View {
         content
             .onAppear {
-            viewModel.refreshAuthorization()
-            if viewModel.isAuthorized {
-                viewModel.loadAlbums()
+                viewModel.refreshAuthorization()
+                if viewModel.isAuthorized {
+                    viewModel.loadAlbums()
+                }
             }
-        }
+            .statusBar(hidden: true)
             .onChange(of: scenePhase) { _, phase in
                 viewModel.setActive(phase == .active)
             }
@@ -33,6 +39,9 @@ struct ContentView: View {
                 if status == .authorized || status == .limited {
                     viewModel.loadAlbums()
                 }
+            }
+            .onDisappear {
+                hideControlsTask?.cancel()
             }
     }
 
@@ -68,9 +77,67 @@ struct ContentView: View {
     }
 
     private var slideshowStage: some View {
-        ZStack {
-            Color.black
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let topPadding: CGFloat = 12
 
+            ZStack {
+                Color.black
+                    .ignoresSafeArea()
+
+                slideshowContent
+                    .offset(x: dragOffset + dragTranslation)
+                    .animation(.easeInOut(duration: 0.2), value: dragOffset)
+                    .ignoresSafeArea()
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .contentShape(Rectangle())
+            .overlay(alignment: .topTrailing) {
+                if showControls {
+                    HStack(spacing: 12) {
+                        Button {
+                            openCurrentPhotoInPhotos()
+                        } label: {
+                            Image(systemName: "photo")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .disabled(viewModel.currentAssetIdentifier == nil)
+
+                        Button {
+                            hideControlsTask?.cancel()
+                            showControls = true
+                            showSettingsSheet = true
+                        } label: {
+                            Image(systemName: "gearshape.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
+                    .padding(.top, topPadding)
+                    .padding(.trailing, 12)
+                }
+            }
+            .highPriorityGesture(
+                TapGesture(count: 2)
+                    .onEnded {
+                        isAspectFill.toggle()
+                        showControlsTemporarily()
+                    }
+            )
+            .onTapGesture {
+                toggleControls()
+            }
+            .gesture(dragGesture(width: width))
+        }
+    }
+
+    private var slideshowContent: some View {
+        Group {
             if viewModel.isLoadingAssets {
                 ProgressView("Loading photos…")
                     .tint(.white)
@@ -90,47 +157,101 @@ struct ContentView: View {
                 .foregroundStyle(.white.opacity(0.8))
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea()
-        .overlay(alignment: .topTrailing) {
-            if showControls {
-                Button {
-                    showSettingsSheet = true
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .padding(10)
-                        .background(.ultraThinMaterial, in: Circle())
-                }
-                .padding(.top, 12)
-                .padding(.trailing, 12)
+    }
+
+    private func dragGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 20)
+            .updating($dragTranslation) { value, state, _ in
+                guard canDrag(value: value) else { return }
+                state = value.translation.width
+            }
+            .onEnded { value in
+                guard canDrag(value: value) else { return }
+                handleDragEnd(value, width: width)
+            }
+    }
+
+    private func canDrag(value: DragGesture.Value) -> Bool {
+        guard !isTransitioning, viewModel.currentImage != nil else { return false }
+        return abs(value.translation.width) > abs(value.translation.height)
+    }
+
+    private func handleDragEnd(_ value: DragGesture.Value, width: CGFloat) {
+        let translation = value.translation.width
+        guard abs(translation) > swipeThreshold else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                dragOffset = 0
+            }
+            return
+        }
+
+        let direction: CGFloat = translation < 0 ? -1 : 1
+        isTransitioning = true
+        dragOffset = translation
+
+        withAnimation(.easeInOut(duration: 0.2)) {
+            dragOffset = direction * width
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            if direction < 0 {
+                viewModel.showNext()
+            } else {
+                viewModel.showPrevious()
+            }
+
+            dragOffset = -direction * width
+            withAnimation(.easeInOut(duration: 0.2)) {
+                dragOffset = 0
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                isTransitioning = false
             }
         }
-        .highPriorityGesture(
-            TapGesture(count: 2)
-                .onEnded {
-                    isAspectFill.toggle()
-                    showControls = true
-                }
-        )
-        .onTapGesture {
-            showControls.toggle()
+    }
+
+    private func showControlsTemporarily() {
+        hideControlsTask?.cancel()
+        showControls = true
+        hideControlsTask = Task {
+            try? await Task.sleep(nanoseconds: controlsHideDelay)
+            await MainActor.run {
+                showControls = false
+            }
         }
-        .gesture(
-            DragGesture(minimumDistance: 20)
-                .onEnded { value in
-                    guard abs(value.translation.width) > swipeThreshold,
-                          abs(value.translation.width) > abs(value.translation.height) else {
-                        return
-                    }
-                    if value.translation.width < 0 {
-                        viewModel.showNext()
-                    } else {
-                        viewModel.showPrevious()
+    }
+
+    private func toggleControls() {
+        if showControls {
+            hideControlsTask?.cancel()
+            showControls = false
+        } else {
+            showControlsTemporarily()
+        }
+    }
+
+    private func openCurrentPhotoInPhotos() {
+        if let identifier = viewModel.currentAssetIdentifier?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+           var components = URLComponents(string: "photos-redirect://") {
+            components.queryItems = [URLQueryItem(name: "id", value: identifier)]
+            if let url = components.url {
+                openURL(url) { handled in
+                    if !handled {
+                        openPhotosApp()
                     }
                 }
-        )
+                return
+            }
+        }
+
+        openPhotosApp()
+    }
+
+    private func openPhotosApp() {
+        if let url = URL(string: "photos-redirect://") {
+            openURL(url)
+        }
     }
 
     private var settingsForm: some View {
