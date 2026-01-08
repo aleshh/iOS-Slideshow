@@ -38,7 +38,11 @@ struct ContentView: View {
             .onChange(of: viewModel.authorizationStatus) { _, status in
                 if status == .authorized || status == .limited {
                     viewModel.loadAlbums()
+                    autoShowSettingsIfNeeded()
                 }
+            }
+            .onChange(of: viewModel.selectedAlbumID) { _, _ in
+                autoShowSettingsIfNeeded()
             }
             .onDisappear {
                 hideControlsTask?.cancel()
@@ -73,6 +77,9 @@ struct ContentView: View {
                             }
                         }
                 }
+            }
+            .onAppear {
+                autoShowSettingsIfNeeded()
             }
     }
 
@@ -252,6 +259,11 @@ struct ContentView: View {
         if let url = URL(string: "photos-redirect://") {
             openURL(url)
         }
+    }
+
+    private func autoShowSettingsIfNeeded() {
+        guard viewModel.isAuthorized, viewModel.selectedAlbumID == nil else { return }
+        showSettingsSheet = true
     }
 
     private var settingsForm: some View {
