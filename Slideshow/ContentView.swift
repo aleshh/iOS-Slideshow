@@ -7,6 +7,7 @@
 
 import Photos
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var viewModel = SlideshowViewModel()
@@ -19,9 +20,16 @@ struct ContentView: View {
     @State private var dragOffset: CGFloat = 0
     @State private var isTransitioning = false
     @State private var hideControlsTask: Task<Void, Never>?
+    @State private var swipeDirection: SwipeDirection?
 
     private let swipeThreshold: CGFloat = 50
     private let controlsHideDelay: UInt64 = 1_500_000_000
+    private let swipeAnimationDuration: TimeInterval = 0.2
+
+    private enum SwipeDirection {
+        case next
+        case previous
+    }
 
     var body: some View {
         content
@@ -92,10 +100,7 @@ struct ContentView: View {
                 Color.black
                     .ignoresSafeArea()
 
-                slideshowContent
-                    .offset(x: dragOffset + dragTranslation)
-                    .animation(.easeInOut(duration: 0.2), value: dragOffset)
-                    .ignoresSafeArea()
+                slideshowContent(width: width)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
             .contentShape(Rectangle())
@@ -143,26 +148,72 @@ struct ContentView: View {
         }
     }
 
-    private var slideshowContent: some View {
-        Group {
-            if viewModel.isLoadingAssets {
-                ProgressView("Loading photos…")
-                    .tint(.white)
-            } else if let image = viewModel.currentImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: isAspectFill ? .fill : .fit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .clipped()
-                    .animation(.easeInOut(duration: 0.2), value: isAspectFill)
-            } else {
-                ContentUnavailableView(
-                    "No Photos",
-                    systemImage: "photo.on.rectangle",
-                    description: Text("Pick another album with photos.")
-                )
-                .foregroundStyle(.white.opacity(0.8))
+    private func slideshowContent(width: CGFloat) -> some View {
+        let totalOffset = dragOffset + dragTranslation
+        let activeDirection = swipeDirection ?? swipeDirection(for: totalOffset)
+        let incomingImage = incomingImage(for: activeDirection)
+        let shouldShowIncoming = incomingImage != nil && (abs(totalOffset) > 0 || isTransitioning)
+
+        return ZStack {
+            currentSlide
+                .offset(x: totalOffset)
+
+            if let activeDirection, shouldShowIncoming, let incomingImage {
+                imageView(for: incomingImage)
+                    .offset(x: incomingOffset(for: activeDirection, totalOffset: totalOffset, width: width))
             }
+        }
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private var currentSlide: some View {
+        if viewModel.isLoadingAssets {
+            ProgressView("Loading photos…")
+                .tint(.white)
+        } else if let image = viewModel.currentImage {
+            imageView(for: image)
+        } else {
+            ContentUnavailableView(
+                "No Photos",
+                systemImage: "photo.on.rectangle",
+                description: Text("Pick another album with photos.")
+            )
+            .foregroundStyle(.white.opacity(0.8))
+        }
+    }
+
+    private func imageView(for image: UIImage) -> some View {
+        Image(uiImage: image)
+            .resizable()
+            .aspectRatio(contentMode: isAspectFill ? .fill : .fit)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+            .animation(.easeInOut(duration: 0.2), value: isAspectFill)
+    }
+
+    private func swipeDirection(for offset: CGFloat) -> SwipeDirection? {
+        guard offset != 0 else { return nil }
+        return offset < 0 ? .next : .previous
+    }
+
+    private func incomingImage(for direction: SwipeDirection?) -> UIImage? {
+        switch direction {
+        case .next:
+            return viewModel.nextImage
+        case .previous:
+            return viewModel.previousImage
+        case .none:
+            return nil
+        }
+    }
+
+    private func incomingOffset(for direction: SwipeDirection, totalOffset: CGFloat, width: CGFloat) -> CGFloat {
+        switch direction {
+        case .next:
+            return totalOffset + width
+        case .previous:
+            return totalOffset - width
         }
     }
 
@@ -172,6 +223,10 @@ struct ContentView: View {
                 guard canDrag(value: value) else { return }
                 state = value.translation.width
             }
+            .onChanged { value in
+                guard canDrag(value: value) else { return }
+                swipeDirection = value.translation.width < 0 ? .next : .previous
+            }
             .onEnded { value in
                 guard canDrag(value: value) else { return }
                 handleDragEnd(value, width: width)
@@ -179,42 +234,40 @@ struct ContentView: View {
     }
 
     private func canDrag(value: DragGesture.Value) -> Bool {
-        guard !isTransitioning, viewModel.currentImage != nil else { return false }
+        guard !isTransitioning, viewModel.currentImage != nil, viewModel.hasMultipleAssets else { return false }
         return abs(value.translation.width) > abs(value.translation.height)
     }
 
     private func handleDragEnd(_ value: DragGesture.Value, width: CGFloat) {
         let translation = value.translation.width
         guard abs(translation) > swipeThreshold else {
-            withAnimation(.easeOut(duration: 0.2)) {
+            withAnimation(.easeOut(duration: swipeAnimationDuration)) {
                 dragOffset = 0
             }
+            swipeDirection = nil
             return
         }
 
-        let direction: CGFloat = translation < 0 ? -1 : 1
+        let direction: SwipeDirection = translation < 0 ? .next : .previous
+        swipeDirection = direction
         isTransitioning = true
         dragOffset = translation
 
-        withAnimation(.easeInOut(duration: 0.2)) {
-            dragOffset = direction * width
+        let targetOffset: CGFloat = direction == .next ? -width : width
+        withAnimation(.easeInOut(duration: swipeAnimationDuration)) {
+            dragOffset = targetOffset
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            if direction < 0 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + swipeAnimationDuration) {
+            if direction == .next {
                 viewModel.showNext()
             } else {
                 viewModel.showPrevious()
             }
 
-            dragOffset = -direction * width
-            withAnimation(.easeInOut(duration: 0.2)) {
-                dragOffset = 0
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                isTransitioning = false
-            }
+            dragOffset = 0
+            swipeDirection = nil
+            isTransitioning = false
         }
     }
 

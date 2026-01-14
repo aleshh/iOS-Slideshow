@@ -87,6 +87,8 @@ final class SlideshowViewModel: ObservableObject {
         }
     }
     @Published var currentImage: UIImage?
+    @Published var nextImage: UIImage?
+    @Published var previousImage: UIImage?
     @Published private(set) var currentAssetIdentifier: String?
     @Published var isLoadingAlbums = false
     @Published var isLoadingAssets = false
@@ -96,7 +98,9 @@ final class SlideshowViewModel: ObservableObject {
     private var shuffledAssets: [PHAsset] = []
     private var currentIndex = 0
     private var slideshowTimer: Timer?
-    private var imageRequestID: PHImageRequestID?
+    private var currentRequestID: PHImageRequestID?
+    private var nextRequestID: PHImageRequestID?
+    private var previousRequestID: PHImageRequestID?
     private var isActive = true
 
     init() {
@@ -112,6 +116,10 @@ final class SlideshowViewModel: ObservableObject {
 
     var isAuthorized: Bool {
         authorizationStatus == .authorized || authorizationStatus == .limited
+    }
+
+    var hasMultipleAssets: Bool {
+        allAssets.count > 1
     }
 
     func refreshAuthorization() {
@@ -198,7 +206,7 @@ final class SlideshowViewModel: ObservableObject {
             currentImage = nil
             stopTimer()
         } else {
-            showCurrentAsset()
+            updateSurroundingImages()
             scheduleTimer()
         }
     }
@@ -232,6 +240,8 @@ final class SlideshowViewModel: ObservableObject {
         }
 
         let nextIndex = currentIndex + 1
+        let shouldReshuffle = nextIndex >= shuffledAssets.count
+        let upcomingImage = shouldReshuffle ? nil : nextImage
         if nextIndex >= shuffledAssets.count {
             shuffledAssets = allAssets.shuffled()
             currentIndex = 0
@@ -239,7 +249,10 @@ final class SlideshowViewModel: ObservableObject {
             currentIndex = nextIndex
         }
 
-        showCurrentAsset()
+        if let upcomingImage {
+            currentImage = upcomingImage
+        }
+        updateSurroundingImages()
         scheduleTimer()
     }
 
@@ -250,31 +263,64 @@ final class SlideshowViewModel: ObservableObject {
             return
         }
 
+        let upcomingImage = previousImage
         if currentIndex == 0 {
             currentIndex = max(shuffledAssets.count - 1, 0)
         } else {
             currentIndex -= 1
         }
 
-        showCurrentAsset()
+        if let upcomingImage {
+            currentImage = upcomingImage
+        }
+        updateSurroundingImages()
         scheduleTimer()
     }
 
-    private func showCurrentAsset() {
+    private func updateSurroundingImages() {
         guard !shuffledAssets.isEmpty else {
             currentImage = nil
+            nextImage = nil
+            previousImage = nil
             currentAssetIdentifier = nil
             return
         }
 
-        let asset = shuffledAssets[currentIndex]
-        currentAssetIdentifier = asset.localIdentifier
-        requestImage(for: asset)
+        let count = shuffledAssets.count
+        let currentAsset = shuffledAssets[currentIndex]
+        currentAssetIdentifier = currentAsset.localIdentifier
+        requestImage(for: currentAsset, requestID: &currentRequestID) { [weak self] image in
+            self?.currentImage = image
+        }
+
+        guard count > 1 else {
+            nextImage = nil
+            previousImage = nil
+            return
+        }
+
+        let nextIndex = (currentIndex + 1) % count
+        let previousIndex = (currentIndex - 1 + count) % count
+
+        let nextAsset = shuffledAssets[nextIndex]
+        let previousAsset = shuffledAssets[previousIndex]
+
+        requestImage(for: nextAsset, requestID: &nextRequestID) { [weak self] image in
+            self?.nextImage = image
+        }
+
+        requestImage(for: previousAsset, requestID: &previousRequestID) { [weak self] image in
+            self?.previousImage = image
+        }
     }
 
-    private func requestImage(for asset: PHAsset) {
-        if let imageRequestID {
-            imageManager.cancelImageRequest(imageRequestID)
+    private func requestImage(
+        for asset: PHAsset,
+        requestID: inout PHImageRequestID?,
+        completion: @escaping @MainActor (UIImage?) -> Void
+    ) {
+        if let requestID {
+            imageManager.cancelImageRequest(requestID)
         }
 
         let options = PHImageRequestOptions()
@@ -284,15 +330,14 @@ final class SlideshowViewModel: ObservableObject {
 
         let targetSize = PHImageManagerMaximumSize
 
-        imageRequestID = imageManager.requestImage(
+        requestID = imageManager.requestImage(
             for: asset,
             targetSize: targetSize,
             contentMode: .aspectFit,
             options: options
-        ) { [weak self] image, _ in
-            guard let self else { return }
+        ) { image, _ in
             Task { @MainActor in
-                self.currentImage = image
+                completion(image)
             }
         }
     }
@@ -319,6 +364,8 @@ final class SlideshowViewModel: ObservableObject {
         shuffledAssets = []
         currentIndex = 0
         currentImage = nil
+        nextImage = nil
+        previousImage = nil
         currentAssetIdentifier = nil
         stopTimer()
     }
