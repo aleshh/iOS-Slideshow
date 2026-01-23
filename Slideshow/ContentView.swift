@@ -16,6 +16,10 @@ struct ContentView: View {
     @State private var showControls = false
     @State private var showSettingsSheet = false
     @State private var isAspectFill = false
+    @State private var zoomScale: CGFloat = 1
+    @GestureState private var zoomGestureScale: CGFloat = 1
+    @State private var panOffset: CGSize = .zero
+    @GestureState private var panTranslation: CGSize = .zero
     @GestureState private var dragTranslation: CGFloat = 0
     @State private var dragOffset: CGFloat = 0
     @State private var isTransitioning = false
@@ -25,10 +29,19 @@ struct ContentView: View {
     private let swipeThreshold: CGFloat = 50
     private let controlsHideDelay: UInt64 = 1_500_000_000
     private let swipeAnimationDuration: TimeInterval = 0.2
+    private let maxZoomScale: CGFloat = 5
 
     private enum SwipeDirection {
         case next
         case previous
+    }
+
+    private var effectiveZoomScale: CGFloat {
+        min(max(zoomScale * zoomGestureScale, 1), maxZoomScale)
+    }
+
+    private var isZoomed: Bool {
+        effectiveZoomScale > 1.01
     }
 
     var body: some View {
@@ -50,7 +63,11 @@ struct ContentView: View {
                 }
             }
             .onChange(of: viewModel.selectedAlbumID) { _, _ in
+                resetZoom()
                 autoShowSettingsIfNeeded()
+            }
+            .onChange(of: viewModel.currentAssetIdentifier) { _, _ in
+                resetZoom()
             }
             .onDisappear {
                 hideControlsTask?.cancel()
@@ -93,14 +110,15 @@ struct ContentView: View {
 
     private var slideshowStage: some View {
         GeometryReader { proxy in
-            let width = proxy.size.width
+            let size = proxy.size
+            let width = size.width
             let topPadding: CGFloat = 12
 
             ZStack {
                 Color.black
                     .ignoresSafeArea()
 
-                slideshowContent(width: width)
+                slideshowContent(containerSize: size)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
             .contentShape(Rectangle())
@@ -117,6 +135,18 @@ struct ContentView: View {
                                 .background(.ultraThinMaterial, in: Circle())
                         }
                         .disabled(viewModel.currentAssetIdentifier == nil)
+
+                        Button {
+                            viewModel.togglePause()
+                            showControlsTemporarily()
+                        } label: {
+                            Image(systemName: viewModel.isPaused ? "play.fill" : "pause.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .disabled(viewModel.currentImage == nil)
 
                         Button {
                             hideControlsTask?.cancel()
@@ -138,28 +168,30 @@ struct ContentView: View {
                 TapGesture(count: 2)
                     .onEnded {
                         isAspectFill.toggle()
+                        resetZoom()
                         showControlsTemporarily()
                     }
             )
             .onTapGesture {
                 toggleControls()
             }
-            .gesture(dragGesture(width: width))
+            .simultaneousGesture(dragGesture(width: width))
         }
     }
 
-    private func slideshowContent(width: CGFloat) -> some View {
+    private func slideshowContent(containerSize: CGSize) -> some View {
         let totalOffset = dragOffset + dragTranslation
         let activeDirection = swipeDirection ?? swipeDirection(for: totalOffset)
         let incomingImage = incomingImage(for: activeDirection)
         let shouldShowIncoming = incomingImage != nil && (abs(totalOffset) > 0 || isTransitioning)
+        let width = containerSize.width
 
         return ZStack {
-            currentSlide
+            currentSlide(containerSize: containerSize)
                 .offset(x: totalOffset)
 
             if let activeDirection, shouldShowIncoming, let incomingImage {
-                imageView(for: incomingImage)
+                imageView(for: incomingImage, containerSize: containerSize, isInteractive: false)
                     .offset(x: incomingOffset(for: activeDirection, totalOffset: totalOffset, width: width))
             }
         }
@@ -167,12 +199,12 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var currentSlide: some View {
+    private func currentSlide(containerSize: CGSize) -> some View {
         if viewModel.isLoadingAssets {
             ProgressView("Loading photos…")
                 .tint(.white)
         } else if let image = viewModel.currentImage {
-            imageView(for: image)
+            imageView(for: image, containerSize: containerSize, isInteractive: true)
         } else {
             ContentUnavailableView(
                 "No Photos",
@@ -183,13 +215,39 @@ struct ContentView: View {
         }
     }
 
-    private func imageView(for image: UIImage) -> some View {
-        Image(uiImage: image)
+    @ViewBuilder
+    private func imageView(for image: UIImage, containerSize: CGSize, isInteractive: Bool) -> some View {
+        let baseImage = Image(uiImage: image)
             .resizable()
             .aspectRatio(contentMode: isAspectFill ? .fill : .fit)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .animation(.easeInOut(duration: 0.2), value: isAspectFill)
+
+        if isInteractive {
+            let scale = effectiveZoomScale
+            let offset = clampedOffset(
+                for: image,
+                in: containerSize,
+                scale: scale,
+                offset: combinedOffset(panOffset, panTranslation)
+            )
+
+            if isZoomed {
+                baseImage
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .gesture(magnificationGesture(for: image, in: containerSize))
+                    .simultaneousGesture(panGesture(for: image, in: containerSize))
+            } else {
+                baseImage
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .gesture(magnificationGesture(for: image, in: containerSize))
+            }
+        } else {
+            baseImage
+        }
     }
 
     private func swipeDirection(for offset: CGFloat) -> SwipeDirection? {
@@ -234,7 +292,7 @@ struct ContentView: View {
     }
 
     private func canDrag(value: DragGesture.Value) -> Bool {
-        guard !isTransitioning, viewModel.currentImage != nil, viewModel.hasMultipleAssets else { return false }
+        guard !isTransitioning, !isZoomed, viewModel.currentImage != nil, viewModel.hasMultipleAssets else { return false }
         return abs(value.translation.width) > abs(value.translation.height)
     }
 
@@ -292,7 +350,7 @@ struct ContentView: View {
     }
 
     private func openCurrentPhotoInPhotos() {
-        if let identifier = viewModel.currentAssetIdentifier?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        if let identifier = viewModel.currentAssetIdentifier,
            var components = URLComponents(string: "photos-redirect://") {
             components.queryItems = [URLQueryItem(name: "id", value: identifier)]
             if let url = components.url {
@@ -317,6 +375,80 @@ struct ContentView: View {
     private func autoShowSettingsIfNeeded() {
         guard viewModel.isAuthorized, viewModel.selectedAlbumID == nil else { return }
         showSettingsSheet = true
+    }
+
+    private func resetZoom() {
+        zoomScale = 1
+        panOffset = .zero
+    }
+
+    private func magnificationGesture(for image: UIImage, in containerSize: CGSize) -> some Gesture {
+        MagnificationGesture()
+            .updating($zoomGestureScale) { value, state, _ in
+                state = value
+            }
+            .onEnded { value in
+                let newScale = min(max(zoomScale * value, 1), maxZoomScale)
+                zoomScale = newScale
+                if newScale <= 1.01 {
+                    resetZoom()
+                } else {
+                    panOffset = clampedOffset(for: image, in: containerSize, scale: newScale, offset: panOffset)
+                }
+            }
+    }
+
+    private func panGesture(for image: UIImage, in containerSize: CGSize) -> some Gesture {
+        DragGesture()
+            .updating($panTranslation) { value, state, _ in
+                state = value.translation
+            }
+            .onEnded { value in
+                let proposedOffset = combinedOffset(panOffset, value.translation)
+                panOffset = clampedOffset(for: image, in: containerSize, scale: zoomScale, offset: proposedOffset)
+            }
+    }
+
+    private func combinedOffset(_ first: CGSize, _ second: CGSize) -> CGSize {
+        CGSize(width: first.width + second.width, height: first.height + second.height)
+    }
+
+    private func clampedOffset(
+        for image: UIImage,
+        in containerSize: CGSize,
+        scale: CGFloat,
+        offset: CGSize
+    ) -> CGSize {
+        let baseSize = imageDisplaySize(for: image, in: containerSize)
+        let scaledSize = CGSize(width: baseSize.width * scale, height: baseSize.height * scale)
+
+        let maxX = max(0, (scaledSize.width - containerSize.width) / 2)
+        let maxY = max(0, (scaledSize.height - containerSize.height) / 2)
+
+        return CGSize(
+            width: min(max(offset.width, -maxX), maxX),
+            height: min(max(offset.height, -maxY), maxY)
+        )
+    }
+
+    private func imageDisplaySize(for image: UIImage, in containerSize: CGSize) -> CGSize {
+        guard containerSize.width > 0, containerSize.height > 0 else { return .zero }
+        guard image.size.width > 0, image.size.height > 0 else { return containerSize }
+
+        let imageRatio = image.size.width / image.size.height
+        let containerRatio = containerSize.width / containerSize.height
+
+        if isAspectFill {
+            if imageRatio > containerRatio {
+                return CGSize(width: containerSize.height * imageRatio, height: containerSize.height)
+            }
+            return CGSize(width: containerSize.width, height: containerSize.width / imageRatio)
+        }
+
+        if imageRatio > containerRatio {
+            return CGSize(width: containerSize.width, height: containerSize.width / imageRatio)
+        }
+        return CGSize(width: containerSize.height * imageRatio, height: containerSize.height)
     }
 
     private var settingsForm: some View {

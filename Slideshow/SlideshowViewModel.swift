@@ -92,6 +92,7 @@ final class SlideshowViewModel: ObservableObject {
     @Published private(set) var currentAssetIdentifier: String?
     @Published var isLoadingAlbums = false
     @Published var isLoadingAssets = false
+    @Published var isPaused = false
 
     private let imageManager = PHCachingImageManager()
     private var allAssets: [PHAsset] = []
@@ -144,6 +145,20 @@ final class SlideshowViewModel: ObservableObject {
             scheduleTimer()
         } else {
             stopTimer()
+        }
+    }
+
+    func togglePause() {
+        setPaused(!isPaused)
+    }
+
+    func setPaused(_ paused: Bool) {
+        guard isPaused != paused else { return }
+        isPaused = paused
+        if paused {
+            stopTimer()
+        } else {
+            scheduleTimer()
         }
     }
 
@@ -344,7 +359,7 @@ final class SlideshowViewModel: ObservableObject {
 
     private func scheduleTimer() {
         stopTimer()
-        guard isAuthorized, isActive, !allAssets.isEmpty else { return }
+        guard isAuthorized, isActive, !isPaused, !allAssets.isEmpty else { return }
 
         slideshowTimer = Timer.scheduledTimer(withTimeInterval: selectedInterval.rawValue, repeats: true) { [weak self] _ in
             guard let self else { return }
